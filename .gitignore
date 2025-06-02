@@ -1,2 +1,5 @@
 venv
 ppo_eversion_tensorboard
+DQN_eversion_tensorboard
+PPO_eversion_tensorboard
+__pycache__
