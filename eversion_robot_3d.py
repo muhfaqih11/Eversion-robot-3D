@@ -50,13 +50,21 @@ class EversionRobot3D(gym.Env):
         self.observation_space = spaces.Box(-high, high, dtype=np.float32)
 
         self.steps_left = self.MAX_EPISODE
-        self.low = [-1.5, 0.5, 0]  # 3D bounds
+        # Bounds - Z targets only in positive space
+        self.low = [-1.5, 0.5, 0]  # Z starts from 0 (floor level)
         self.high = [1.5, 3.0, 1.0]
-        self.x_target = [
-            random.uniform(self.low[0], self.high[0]),
-            random.uniform(self.low[1], self.high[1]),
-            random.uniform(self.low[2], self.high[2]),
-        ]
+
+        # 3D Obstacles - initialize early so we can use them for target generation
+        if self.use_obstacle:
+            self.obs_center = []
+            self.obs_center.append(np.array([0.0, 3.0, 0.0]))
+            self.obs_center.append(np.array([-1.1, 1.2, 0.5]))
+            self.obs_center.append(np.array([1, 1.0, 0.3]))
+            self.radius = [0.2, 0.2, 0.2]
+            self.min_target_clearance = 0.1  # Minimum distance from obstacles
+
+        # Generate initial target
+        self.x_target = self._generate_safe_target()
 
         if self.use_obstacle:
             self.state = [
@@ -95,13 +103,46 @@ class EversionRobot3D(gym.Env):
         self.safety_param = 2
         self.safety_penalty = 10
 
-        # 3D Obstacles
-        if self.use_obstacle:
-            self.obs_center = []
-            self.obs_center.append(np.array([0.0, 2.0, 0.0]))
-            self.obs_center.append(np.array([-1.1, 1.2, 0.5]))
-            self.obs_center.append(np.array([0.7, 1.0, 0.3]))
-            self.radius = [0.2, 0.2, 0.2]
+    def _is_target_safe(self, target_pos):
+        """Check if a target position is safe (outside obstacles with clearance)"""
+        if not self.use_obstacle:
+            return True
+
+        target_array = np.array(target_pos)
+        for i, obs_pos in enumerate(self.obs_center):
+            distance = np.linalg.norm(target_array - obs_pos)
+            # Check if target is too close to obstacle (within obstacle + clearance)
+            if distance <= (self.radius[i] + self.min_target_clearance):
+                return False
+        return True
+
+    def _generate_safe_target(self):
+        """Generate a target position that is safe from obstacles"""
+        max_attempts = 100  # Prevent infinite loop
+        attempts = 0
+
+        while attempts < max_attempts:
+            # Generate random target within bounds
+            target_candidate = [
+                random.uniform(self.low[0], self.high[0]),
+                random.uniform(self.low[1], self.high[1]),
+                random.uniform(self.low[2], self.high[2]),
+            ]
+
+            # Check if this target is safe
+            if self._is_target_safe(target_candidate):
+                return target_candidate
+
+            attempts += 1
+
+        # If we can't find a safe target after max_attempts,
+        # place it at a known safe location (high up and away from obstacles)
+        print(
+            "Warning: Could not generate safe target after",
+            max_attempts,
+            "attempts. Using fallback position.",
+        )
+        return [0.0, 2.5, 0.8]  # Safe fallback position
 
     def kinematic_matrix(self, phi, kappa, s):
         """
@@ -200,6 +241,40 @@ class EversionRobot3D(gym.Env):
 
         return x_array, y_array, z_array
 
+    def check_floor_collision(
+        self, phi_array=None, kappa_array=None, length_array=None
+    ):
+        """Check if any part of the robot would go below z=0 (floor collision)"""
+        # Use provided arrays or current state
+        if phi_array is None:
+            phi_array = self.phi_array
+        if kappa_array is None:
+            kappa_array = self.kappa_array
+        if length_array is None:
+            length_array = self.length_array
+
+        for seg_idx in range(len(length_array)):
+            # Compute segment pose with temporary arrays
+            T_prior_segment = self.static_segment_3d(
+                phi_array, kappa_array, length_array, seg_idx
+            )
+
+            length = length_array[seg_idx]
+            phi = phi_array[seg_idx]
+            kappa = kappa_array[seg_idx]
+
+            indeks_maks = max(1, math.floor(length / self.delta_length))
+
+            for i in range(indeks_maks + 1):
+                s = (i / indeks_maks) * length if indeks_maks > 0 else 0
+                T_segment = self.kinematic_matrix(phi, kappa, s)
+                T_total = T_prior_segment @ T_segment
+
+                # Check if any point goes below floor
+                if T_total[2, 3] < 0:
+                    return True
+        return False
+
     def check_collision_3d(self):
         """Check collision with 3D obstacles"""
         collision = False
@@ -259,54 +334,99 @@ class EversionRobot3D(gym.Env):
     def step(self, action):
         self.act = action
 
+        # Store current state for rollback if needed
+        prev_length = self.length
+        prev_phi = self.phi
+        prev_kappa = self.kappa
+        prev_length_array = self.length_array.copy()
+        prev_phi_array = self.phi_array.copy()
+        prev_kappa_array = self.kappa_array.copy()
+
         # Modified action mapping for 3D:
         # 0: extend, 1: retract,
         # 2: bend right (negative X), 3: bend left (positive X),
         # 4: increase phi (counter-clockwise), 5: decrease phi (clockwise),
         # 6: no action
 
+        action_valid = True
+
         if action == 0:  # Extend
-            self.length = min(self.length + self.delta_length, self.length_max)
+            new_length = min(self.length + self.delta_length, self.length_max)
+            # Test if extending would cause floor collision
+            test_length_array = self.length_array.copy()
+            test_length_array[-1] = new_length
+            if not self.check_floor_collision(length_array=test_length_array):
+                self.length = new_length
+            else:
+                action_valid = False
         elif action == 1:  # Retract
             self.length = max(self.length - self.delta_length, 0)
         elif action == 2:  # Bend right (negative X)
-            self.kappa = min(self.kappa + self.delta_kappa, self.kappa_max)
+            new_kappa = min(self.kappa + self.delta_kappa, self.kappa_max)
+            # Test if increasing kappa would cause floor collision
+            test_kappa_array = self.kappa_array.copy()
+            test_kappa_array[-1] = new_kappa
+            if not self.check_floor_collision(kappa_array=test_kappa_array):
+                self.kappa = new_kappa
+            else:
+                action_valid = False
         elif action == 3:  # Bend left (positive X)
-            # self.phi = math.pi / 2  # 90° or +X direction
-            self.kappa = min(self.kappa - self.delta_kappa, self.kappa_max)
+            new_kappa = max(self.kappa - self.delta_kappa, -self.kappa_max)
+            # Test if changing kappa would cause floor collision
+            test_kappa_array = self.kappa_array.copy()
+            test_kappa_array[-1] = new_kappa
+            if not self.check_floor_collision(kappa_array=test_kappa_array):
+                self.kappa = new_kappa
+            else:
+                action_valid = False
         elif action == 4:  # Increase phi (counter-clockwise rotation)
-            self.phi = (self.phi + self.delta_phi) % (2 * math.pi)
+            new_phi = (self.phi + self.delta_phi) % (2 * math.pi)
+            # Test if changing phi would cause floor collision
+            test_phi_array = self.phi_array.copy()
+            test_phi_array[-1] = new_phi
+            if not self.check_floor_collision(phi_array=test_phi_array):
+                self.phi = new_phi
+            else:
+                action_valid = False
         elif action == 5:  # Decrease phi (clockwise rotation)
-            self.phi = (self.phi - self.delta_phi) % (2 * math.pi)
+            new_phi = (self.phi - self.delta_phi) % (2 * math.pi)
+            # Test if changing phi would cause floor collision
+            test_phi_array = self.phi_array.copy()
+            test_phi_array[-1] = new_phi
+            if not self.check_floor_collision(phi_array=test_phi_array):
+                self.phi = new_phi
+            else:
+                action_valid = False
         # action == 6 is no action
 
-        # Update arrays
-        if 0 <= self.length < self.length_max:
-            self.length_array[-1] = self.length
-            self.phi_array[-1] = self.phi
-            self.kappa_array[-1] = self.kappa
-        elif self.length >= self.length_max:
-            if len(self.length_array) < self.segment_num_max:
-                # Add new segment
-                self.length = 0
-                self.phi = self.phi_array[-1]  # Maintain direction
-                self.kappa = 0
-                self.length_array.append(self.length)
-                self.phi_array.append(self.phi)
-                self.kappa_array.append(self.kappa)
-            else:
-                self.length = self.length_max
-        elif self.length < 0:
-            if len(self.length_array) > 1:
-                # Remove last segment
-                self.length_array.pop()
-                self.phi_array.pop()
-                self.kappa_array.pop()
-                self.length = self.length_array[-1]
-                self.phi = self.phi_array[-1]
-                self.kappa = self.kappa_array[-1]
-            else:
-                self.length = 0
+        # Update arrays only if action was valid
+        if action_valid:
+            if 0 <= self.length < self.length_max:
+                self.length_array[-1] = self.length
+                self.phi_array[-1] = self.phi
+                self.kappa_array[-1] = self.kappa
+            elif self.length >= self.length_max:
+                if len(self.length_array) < self.segment_num_max:
+                    # Add new segment
+                    self.length = 0
+                    self.phi = self.phi_array[-1]  # Maintain direction
+                    self.kappa = 0
+                    self.length_array.append(self.length)
+                    self.phi_array.append(self.phi)
+                    self.kappa_array.append(self.kappa)
+                else:
+                    self.length = self.length_max
+            elif self.length < 0:
+                if len(self.length_array) > 1:
+                    # Remove last segment
+                    self.length_array.pop()
+                    self.phi_array.pop()
+                    self.kappa_array.pop()
+                    self.length = self.length_array[-1]
+                    self.phi = self.phi_array[-1]
+                    self.kappa = self.kappa_array[-1]
+                else:
+                    self.length = 0
 
         # Get tip position
         self.T_static = self.static_segment_3d(
@@ -341,12 +461,13 @@ class EversionRobot3D(gym.Env):
                 self.x_target[2],
             ]
 
-        # Check boundaries
+        # Boundary check - includes floor collision
+        floor_collision = self.check_floor_collision()
         boundary = (
             abs(x_tip) > self.x_threshold
             or abs(y_tip) > self.x_threshold
-            or z_tip < 0
             or z_tip > self.x_threshold
+            or floor_collision
         )
 
         error = np.array([x_tip, y_tip, z_tip]) - np.array(self.x_target)
@@ -364,6 +485,9 @@ class EversionRobot3D(gym.Env):
             reward = -np.linalg.norm(error) ** 2
             if self.use_obstacle:
                 reward = reward + reward_safety
+            # Add small penalty for invalid actions to discourage them
+            if not action_valid:
+                reward -= 10
         else:
             reward = 0
             if boundary:
@@ -383,11 +507,8 @@ class EversionRobot3D(gym.Env):
         return np.array([self.state]), reward, done, False, {}
 
     def reset(self, seed=None):
-        self.x_target = [
-            random.uniform(self.low[0], self.high[0]),
-            random.uniform(self.low[1], self.high[1]),
-            random.uniform(self.low[2], self.high[2]),
-        ]
+        # Generate a new safe target
+        self.x_target = self._generate_safe_target()
 
         if self.use_obstacle:
             self.state = [
@@ -424,14 +545,17 @@ class EversionRobot3D(gym.Env):
     def draw_obs_3d(self, ax):
         """Draw 3D obstacles"""
         for i, center in enumerate(self.obs_center):
-            # Draw sphere obstacles
+            # Draw sphere obstacles with proper parametric equations
             u = np.linspace(0, 2 * np.pi, 20)
             v = np.linspace(0, np.pi, 20)
+            u, v = np.meshgrid(u, v)
+
             r = self.radius[i]
-            x_sphere = center[0] + r * np.outer(np.cos(u), np.sin(v))
-            y_sphere = center[1] + r * np.outer(np.sin(u), np.sin(v))
-            z_sphere = center[2] + r * np.outer(np.ones(np.size(u)), np.cos(v))
-            ax.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color="black")
+            x_sphere = center[0] + r * np.sin(v) * np.cos(u)
+            y_sphere = center[1] + r * np.sin(v) * np.sin(u)
+            z_sphere = center[2] + r * np.cos(v)
+
+            ax.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.5, color="red")
 
     def render(self, mode="human"):
         # Initialize figure only once
@@ -442,10 +566,10 @@ class EversionRobot3D(gym.Env):
             self.ax.set_xlabel("X")
             self.ax.set_ylabel("Y")
             self.ax.set_zlabel("Z")
-            self.ax.set_title("3D Eversion Robot")
+            self.ax.set_title("3D Eversion Robot - Floor Collision Prevention at Z=0")
             self.ax.set_xlim([-2, 2])
             self.ax.set_ylim([0, 4])
-            self.ax.set_zlim([0, 4])
+            self.ax.set_zlim([0, 4])  # Z starts from 0 (floor level)
             self.ax.view_init(elev=20, azim=-35)
 
             # Store references to plotted objects for updating
@@ -453,17 +577,28 @@ class EversionRobot3D(gym.Env):
             self.segment_points = []
             self.target_marker = None
             self.obstacle_surfaces = []
+            self.floor_surface = None  # Add floor surface reference
         else:
 
             for points in self.segment_points:
                 points.remove()
             if self.target_marker:
                 self.target_marker.remove()
+            if self.floor_surface:
+                self.floor_surface.remove()
             for surface in self.obstacle_surfaces:
                 surface.remove()
             self.segment_lines = []
             self.segment_points = []
             self.obstacle_surfaces = []
+
+        # Draw green floor at z = 0
+        x_floor = np.array([[-2, 2], [-2, 2]])
+        y_floor = np.array([[0, 0], [4, 4]])
+        z_floor = np.array([[0, 0], [0, 0]])
+        self.floor_surface = self.ax.plot_surface(
+            x_floor, y_floor, z_floor, alpha=0.3, color="green"
+        )
 
         # Draw all segments with 2-color scheme
         for i in range(len(self.length_array)):
@@ -490,34 +625,21 @@ class EversionRobot3D(gym.Env):
         # Draw obstacles if enabled
         if self.use_obstacle:
             for i, center in enumerate(self.obs_center):
+                # Draw sphere obstacles with proper parametric equations
                 u = np.linspace(0, 2 * np.pi, 20)
                 v = np.linspace(0, np.pi, 20)
+                u, v = np.meshgrid(u, v)
+
                 r = self.radius[i]
-                x_sphere = center[0] + r * np.outer(np.cos(u), np.sin(v))
-                y_sphere = center[1] + r * np.outer(np.sin(u), np.sin(v))
-                z_sphere = center[2] + r * np.outer(np.ones(np.size(u)), np.cos(v))
+                x_sphere = center[0] + r * np.sin(v) * np.cos(u)
+                y_sphere = center[1] + r * np.sin(v) * np.sin(u)
+                z_sphere = center[2] + r * np.cos(v)
+
                 surface = self.ax.plot_surface(
-                    x_sphere, y_sphere, z_sphere, alpha=1, color="black"
+                    x_sphere, y_sphere, z_sphere, alpha=0.5, color="red"
                 )
                 self.obstacle_surfaces.append(surface)
 
         # Update the figure without clearing it
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
-
-        # Print status
-        # if self.use_obstacle:
-        #     print(f'State {[round(x, 3) for x in self.state]}, action: {self.act}, '
-        #         f'done: {self.cur_done}, phi: {[round(x, 3) for x in self.phi_array]}, '
-        #         f'kappa: {[round(x, 3) for x in self.kappa_array]}, '
-        #         f'length: {[round(x, 3) for x in self.length_array]}, '
-        #         f'reward: {round(self.cur_reward, 3)}, collision: {self.flag_collision}')
-        # else:
-        #     print(f'State {[round(x, 3) for x in self.state]}, action: {self.act}, '
-        #         f'done: {self.cur_done}, phi: {[round(x, 3) for x in self.phi_array]}, '
-        #         f'kappa: {[round(x, 3) for x in self.kappa_array]}, '
-        #         f'length: {[round(x, 3) for x in self.length_array]}, '
-        #         f'reward: {round(self.cur_reward, 3)}')
-
-        # Small pause to allow interaction
-        # plt.pause(0.001)
